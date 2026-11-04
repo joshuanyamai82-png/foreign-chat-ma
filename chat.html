@@ -258,10 +258,79 @@
 (() => {
   "use strict";
 
+  /* ================================================================
+     SESSION STORAGE HELPERS
+     Everything below uses sessionStorage (cleared when the browser
+     tab/window closes) plus two expiry guards:
+       • 24h maximum session length (sessionStart timestamp)
+       • 8h maximum time away (lastActive timestamp)
+     On expiry the entire session is wiped and the tutor is sent
+     back to signup.html to start fresh — no balances, no unlocked
+     learners, no withdrawal status survives.
+     ================================================================ */
+  const SESSION_START_KEY = "__sk_session_start";
+  const LAST_ACTIVE_KEY   = "__sk_last_active";
+  const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+  const AWAY_MAX_MS        = 8  * 60 * 60 * 1000; // 8 hours
+
+  const store = {
+    get(key)      { try { return sessionStorage.getItem(key); } catch { return null; } },
+    set(key, val) { try { sessionStorage.setItem(key, String(val)); } catch {} },
+    remove(key)   { try { sessionStorage.removeItem(key); } catch {} },
+    clear()       { try { sessionStorage.clear(); } catch {} }
+  };
+
+  function hardReset() {
+    store.clear();
+    window.location.replace("signup.html");
+  }
+
+  function getSessionStart() {
+    const v = store.get(SESSION_START_KEY);
+    return v ? Number(v) : 0;
+  }
+  function getLastActive() {
+    const v = store.get(LAST_ACTIVE_KEY);
+    return v ? Number(v) : 0;
+  }
+  function stampSessionStart() {
+    if (!getSessionStart()) store.set(SESSION_START_KEY, Date.now());
+  }
+  function isSessionFresh() {
+    const start = getSessionStart();
+    if (start > 0 && (Date.now() - start) > SESSION_MAX_AGE_MS) return false;
+    const last = getLastActive();
+    if (last > 0 && (Date.now() - last) > AWAY_MAX_MS) return false;
+    return true;
+  }
+
+  // Run before anything else — if session is stale, wipe + redirect.
+  if (!isSessionFresh()) {
+    hardReset();
+    return;
+  }
+  stampSessionStart();
+
+  // Track when the tab is hidden; check when it becomes visible again.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      store.set(LAST_ACTIVE_KEY, Date.now());
+    } else if (document.visibilityState === "visible") {
+      if (!isSessionFresh()) hardReset();
+    }
+  });
+
+  // Handle bfcache restore (back-forward navigation).
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted && !isSessionFresh()) hardReset();
+  });
+
   /* ---------------- Tutor session guard ---------------- */
-  const tutor = JSON.parse(sessionStorage.getItem("tutorProfile") || "{}");
+  const tutor = (() => {
+    try { return JSON.parse(store.get("tutorProfile") || "{}"); } catch { return {}; }
+  })();
   if (!tutor.name) {
-    window.location.href = "signup.html";
+    window.location.replace("signup.html");
     return;
   }
   document.getElementById("tutorName").textContent = tutor.name.split(" ")[0] || "Tutor";
@@ -502,7 +571,8 @@
   const REPLY_SILENCE_MS = 3200;
   const CLOSE_SILENCE_MS = 4000;
 
-  let earningsBalance = Number(localStorage.getItem("earningsBalance") || 0);
+  // Read initial balance from sessionStorage (not localStorage)
+  let earningsBalance = Number(store.get("earningsBalance") || 0);
 
   /* ---------------- Balance ---------------- */
   function updateBalanceDisplay() {
@@ -510,28 +580,32 @@
   }
   function addEarnings(amount) {
     earningsBalance += amount;
-    localStorage.setItem("earningsBalance", String(earningsBalance));
+    store.set("earningsBalance", earningsBalance);
     updateBalanceDisplay();
   }
 
   /* ================================================================
-     PER-LEARNER ACTIVATION
+     PER-LEARNER ACTIVATION — stored in sessionStorage
      ================================================================ */
   const ACTIVATED_KEY = "activatedContacts";
 
   function isContactActivated(id) {
     try {
-      const list = JSON.parse(localStorage.getItem(ACTIVATED_KEY) || "[]");
+      const raw = store.get(ACTIVATED_KEY) || "[]";
+      const list = JSON.parse(raw);
       return Array.isArray(list) && list.includes(id);
-    } catch (e) { return false; }
+    } catch { return false; }
   }
 
   function markContactActivated(id) {
     let list = [];
-    try { list = JSON.parse(localStorage.getItem(ACTIVATED_KEY) || "[]"); } catch (e) { list = []; }
+    try {
+      const raw = store.get(ACTIVATED_KEY) || "[]";
+      list = JSON.parse(raw);
+    } catch { list = []; }
     if (!Array.isArray(list)) list = [];
     if (!list.includes(id)) list.push(id);
-    localStorage.setItem(ACTIVATED_KEY, JSON.stringify(list));
+    store.set(ACTIVATED_KEY, JSON.stringify(list));
   }
 
   /* ================================================================
@@ -875,7 +949,7 @@
   });
 
   /* ================================================================
-     OPEN CHAT — pushes a history entry so back is intercepted
+     OPEN CHAT
      ================================================================ */
   function openChat(contact) {
     session++;
@@ -901,7 +975,6 @@
     hideQuickReplies();
     msgInput.value = "";
 
-    // Push ONE history entry so back from chat returns to the learner list.
     if (!chatHistoryPushed) {
       try {
         history.pushState({ chatOpen: true }, "");
@@ -935,8 +1008,6 @@
 
   /* ================================================================
      CLOSE CHAT VIEW  (UI only — no history manipulation)
-     Used by popstate (hardware back) because the browser has already
-     popped the history entry for us.
      ================================================================ */
   function closeChatView() {
     conversationPhase = "idle";
@@ -966,7 +1037,6 @@
 
   /* ================================================================
      CLOSE CHAT UI  (UI + history cleanup)
-     Used by the in-app back button and by closeConversation.
      ================================================================ */
   function closeChatUI() {
     if (!app.classList.contains("chat-open")) return;
@@ -1097,7 +1167,7 @@
     });
     await new Promise(r => setTimeout(r, 1600));
     earningsBalance = 0;
-    localStorage.setItem('earningsBalance', '0');
+    store.set('earningsBalance', '0');
     updateBalanceDisplay();
     await Swal.fire({
       title: 'Withdrawal successful',
@@ -1120,7 +1190,7 @@
       });
       return;
     }
-    if (localStorage.getItem('withdrawalFeePaid') === 'true') {
+    if (store.get('withdrawalFeePaid') === 'true') {
       doWithdraw();
       return;
     }
@@ -1130,7 +1200,7 @@
       description: 'Pay a one-time fee of KES 999 to activate M-Pesa withdrawals to your phone.'
     });
     if (paid) {
-      localStorage.setItem('withdrawalFeePaid', 'true');
+      store.set('withdrawalFeePaid', 'true');
       await Swal.fire({
         title: 'Withdrawals activated',
         html: 'You can now withdraw your earnings to M-Pesa anytime.',
@@ -1154,7 +1224,6 @@
 
   searchEl.addEventListener("input", () => renderList(searchEl.value));
 
-  // In-app back button → closes chat, returns to learner list, and pops history.
   backBtn.addEventListener("click", () => {
     closeChatUI();
   });
@@ -1166,8 +1235,6 @@
 
   /* ================================================================
      POPSTATE — hardware / browser back button
-     If a chat is open, the browser has already popped our pushed entry.
-     Just close the UI — do NOT call history.back() again.
      ================================================================ */
   window.addEventListener("popstate", () => {
     if (app.classList.contains("chat-open")) {
